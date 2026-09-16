@@ -1534,25 +1534,42 @@ class PrefixConstrainedLogitsProcessor(LogitsProcessor):
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        mask = torch.full_like(scores, -math.inf)
-        batch_size = input_ids.shape[0] // self._num_beams
+        num_rows, vocab_size = scores.shape
 
-        for batch_id in range(batch_size):
-            for beam_id in range(self._num_beams):
-                sent = input_ids[batch_id * self._num_beams + beam_id]
-                prefix_allowed_tokens = self._prefix_allowed_tokens_fn(batch_id, sent)
-                if len(prefix_allowed_tokens) == 0:
-                    raise ValueError(
-                        f"`prefix_allowed_tokens_fn` returned an empty list for batch ID {batch_id}."
-                        f"This means that the constraint is unsatisfiable. Please check your implementation"
-                        f"of `prefix_allowed_tokens_fn` "
-                    )
-                mask[batch_id * self._num_beams + beam_id, prefix_allowed_tokens] = 0
+        # Allowed token ids and their rows, built on the host and moved to the device once
+        allowed_tokens, allowed_rows = [], []
+        for row_id, sent in enumerate(input_ids):
+            batch_id = row_id // self._num_beams
+            prefix_allowed_tokens = self._prefix_allowed_tokens_fn(batch_id, sent)
+            if len(prefix_allowed_tokens) == 0:
+                raise ValueError(
+                    f"`prefix_allowed_tokens_fn` returned an empty list for batch ID {batch_id}."
+                    f"This means that the constraint is unsatisfiable. Please check your implementation"
+                    f"of `prefix_allowed_tokens_fn` "
+                )
+            prefix_allowed_tokens = torch.as_tensor(prefix_allowed_tokens, dtype=torch.long)
+            allowed_tokens.append(prefix_allowed_tokens)
+            allowed_rows.append(torch.full_like(prefix_allowed_tokens, row_id))
+        allowed_tokens, allowed_rows = torch.cat(allowed_tokens), torch.cat(allowed_rows)
 
-        scores_processed = scores + mask
+        # Out-of-range ids would silently land in another row once flattened, so reject them explicitly
+        if ((allowed_tokens < 0) | (allowed_tokens >= vocab_size)).any():
+            raise ValueError(
+                f"`prefix_allowed_tokens_fn` returned token ids outside of the vocabulary (size {vocab_size}). Please "
+                f"check your implementation of `prefix_allowed_tokens_fn`."
+            )
+        allowed_rows, allowed_tokens = torch.stack([allowed_rows, allowed_tokens]).to(scores.device)
+        allowed_indices = allowed_rows * vocab_size + allowed_tokens
+
+        # Only the allowed positions are written, so no `num_rows * vocab_size` temporaries are needed
+        allowed_scores = scores.reshape(-1)[allowed_indices]
+        scores_processed = torch.full((num_rows, vocab_size), -math.inf, dtype=scores.dtype, device=scores.device)
+        scores_processed.view(-1)[allowed_indices] = allowed_scores
+
         # If the allowed tokens of every beam are already `-inf`, force them with a score of 0 so the constraint holds
-        unsatisfiable = scores_processed.amax(dim=-1).isneginf().view(batch_size, -1).all(dim=-1, keepdim=True)
-        scores_processed = torch.where(unsatisfiable.repeat_interleave(self._num_beams, dim=0), mask, scores_processed)
+        unsatisfiable = scores_processed.amax(dim=-1).isneginf().view(-1, self._num_beams).all(dim=-1)
+        unsatisfiable = unsatisfiable.repeat_interleave(self._num_beams)[allowed_rows]
+        scores_processed.view(-1)[allowed_indices] = allowed_scores.masked_fill(unsatisfiable, 0.0)
         return scores_processed
 
 

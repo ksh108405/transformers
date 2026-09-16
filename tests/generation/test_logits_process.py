@@ -890,6 +890,13 @@ class LogitsProcessorTest(unittest.TestCase):
         self.assertTrue(torch.isinf(filtered_scores[1]).all())
         self.assertListEqual(filtered_scores[2:, [2, 3]].tolist(), [[0.0, 0.0], [0.0, 0.0]])
 
+        # token ids outside of the vocabulary must be rejected instead of leaking into another row
+        for bad_token in (vocab_size, -1):
+            prefix_constrained_logits_proc = PrefixConstrainedLogitsProcessor(
+                lambda batch_id, input_ids: [bad_token], 1
+            )
+            self.assertRaises(ValueError, prefix_constrained_logits_proc, input_ids, scores)
+
     def test_forced_bos_token_logits_processor(self):
         vocab_size = 20
         batch_size = 4
